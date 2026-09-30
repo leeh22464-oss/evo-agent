@@ -2,12 +2,12 @@
 
 - 审查统一 diff，输出结构化问题、修复建议和测试建议
 - GitHub `pull_request` webhook（`opened`、`reopened`、`synchronize`）
-- `agentic` 运行模式：Lead、Security、Correctness/Reliability、Critic
+- `agentic` 运行模式：Lead、Security、Correctness/Reliability、Critic 多 Agent 协作
 - SQLite 保存任务状态、执行轨迹和最终报告
 - JSON API 与 Markdown 报告
 - webhook HMAC-SHA256 签名校验，以及可选的 GitHub PR 评论回写
 - Web 管理台、任务 Dashboard 与 Prometheus 指标
-- Agentic 模式包含 Lead 主 Agent，以及 Security、Correctness/Reliability、Critic 三个从子Agent
+- 普通任务采用固定单轮多 Agent 协作（Lead 2 次、双 Worker 各 1 次、Critic 1 次，共 5 次 LLM 调用）；高风险任务最多允许一轮 Worker 返工
 - LLM unified patch、AST/CST、沙箱前后测试对比与仅 Draft PR 的修复闭环
 - PostgreSQL、Redis 生产模式
 - 失败案例回流、提示词评测、版本激活与回滚
@@ -249,15 +249,51 @@ HTTP / GitHub Webhook
  ReviewService ── TaskStore(SQLite / PostgreSQL)
         │
         ▼
- ReviewHarness (EvoAgent Runtime / checkpoint / resume / budget / trace)
+        ReviewHarness (EvoAgent Runtime / checkpoint / resume / budget / trace)
         │
         ├── DiffParser
         ├── Redis Streams / ACK / lease / retry / DLQ
-        └── ModeRouter（agentic only）
-              ├── Lead：动态委派、返工请求、Critic 调度和最终综合
+        └── Agentic Lead/Workers
+              ├── Lead：一次任务分配并判定风险；高风险时最多请求一轮返工；最终综合
               ├── Security Worker：输入/权限/敏感数据/危险调用链
               ├── Correctness/Reliability Worker：状态/异常/并发/资源/兼容性
-              ├── Critic Worker：由 Lead 委派的盲审、反例与证据挑战
-              └── Gates
+              ├── Critic Worker：一次性盲审、反例与证据挑战
+              └── Gates：格式、证据、置信度和发布门禁
 ```
 
+## Skills 的定位与编写方式
+
+`skills/` 下的目录是 Agent Skill 包，不是工具连接器目录。它们目前以审查领域为中心，是因为本项目的产品目标是代码审查；Skill 的职责是把某个领域的判断标准、调查步骤和输出约束注入模型，而不是自己执行 SQL、调用 GitHub 或创建网络连接。
+
+一个 Skill 包至少包含一个 `SKILL.md`：
+
+```text
+skills/<skill-name>/
+└── SKILL.md                 # YAML 元数据 + 完整运行指令
+```
+
+`SKILL.md` 的 frontmatter 由运行时读取：
+
+- `name`：必须与目录名一致，且只使用小写字母、数字和连字符；
+- `description`：只用于目录发现和路由，应该短而明确地说明何时启用；
+- `allowed-tools`：该 Skill 允许 worker 使用的工具名集合。它是权限声明，不会安装或连接工具；最终权限还会与角色权限取交集；
+
+frontmatter 后的 Markdown 正文才是 Skill 的核心。正文会在 Lead 选中 Skill 后注入对应 worker 的上下文，因此应写成可执行的审查协议，而不是几条标签式提示词。推荐至少包含：任务边界、适用/不适用范围、逐步调查流程、边界条件清单、证据与严重性标准、误报排除规则、修复与验证要求，以及稳定的输出字段。
+
+Skill 可以附带文本资源（例如规范摘录、查询模板或测试清单）。运行时会把资源列入 Skill 包，并仅为已选中的 Skill 注册 `read_skill_resource`；资源不能通过路径穿越或符号链接逃逸出包目录。真正的工具连接由运行时的 `RepositoryToolSuite`、外部集成或插件提供，Skill 只声明“可以使用哪些已经存在的工具”。
+
+运行时流程如下：
+
+```text
+磁盘扫描 SKILL.md
+        ↓ 只暴露 name/description 给 Lead
+Lead 选择相关 Skill
+        ↓ 注入 instructions，并收窄 allowed-tools
+Worker 使用仓库工具取证
+        ↓
+Finding gate 校验格式、证据、置信度和发布条件
+```
+
+因此，把 Skill 内容直接硬编码到全局上下文并不能完全等价：那会让每个任务都携带全部领域规则，增加上下文长度和相互干扰；Skill 机制可以按任务选择、限制工具权限、热加载版本，并通过 `/v1/skill-evolution/*` 做候选评测、门禁和回滚。对于只有一两句、没有独立选择价值的规则，直接放在全局 prompt 更合适；只有当一组规则有清晰边界、需要按场景启用或需要独立演进时，才应该做成 Skill。
+
+本仓库的内置 Skill 已按上述结构补充了完整的 Mission、Review procedure、Checklist、Evidence/severity、Remediation/verification 和 Output contract。新增 Skill 时可复制其中一个目录，再根据领域替换这些章节，并用 `POST /v1/skills/reload` 让新任务加载最新版本。
